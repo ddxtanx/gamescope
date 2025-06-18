@@ -128,6 +128,8 @@ static const int g_nBaseCursorScale = 36;
 LogScope xwm_log("xwm");
 LogScope g_WaitableLog("waitable");
 
+gamescope::ConVar<bool> cv_overlay_unmultiplied_alpha{ "overlay_unmultiplied_alpha", false };
+
 bool g_bWasPartialComposite = false;
 
 bool ShouldDrawCursor();
@@ -139,7 +141,7 @@ bool ShouldDrawCursor();
 gamescope_color_mgmt_tracker_t g_ColorMgmt{};
 
 static gamescope_color_mgmt_luts g_ColorMgmtLutsOverride[ EOTF_Count ];
-static lut3d_t g_ColorMgmtLooks[ EOTF_Count ];
+std::atomic<std::shared_ptr<lut3d_t>> g_ColorMgmtLooks[EOTF_Count];
 
 
 gamescope_color_mgmt_luts g_ColorMgmtLuts[ EOTF_Count ];
@@ -349,7 +351,8 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 
 			EOTF inputEOTF = static_cast<EOTF>( nInputEOTF );
 			float flGain = 1.f;
-			lut3d_t * pLook = g_ColorMgmtLooks[nInputEOTF].lutEdgeSize > 0 ? &g_ColorMgmtLooks[nInputEOTF] : nullptr;
+			std::shared_ptr<lut3d_t> pSharedLook = g_ColorMgmtLooks[ nInputEOTF ];
+			lut3d_t * pLook = pSharedLook && pSharedLook->lutEdgeSize > 0 ? pSharedLook.get() : nullptr;
 
 			if ( inputEOTF == EOTF_Gamma22 )
 			{
@@ -769,14 +772,18 @@ bool set_color_shaperlut_override(const char *path)
 
 bool set_color_look_pq(const char *path)
 {
-	LoadCubeLut( &g_ColorMgmtLooks[EOTF_PQ], path );
+	bool bRaisesBlackLevelFloor = false;
+	g_ColorMgmtLooks[EOTF_PQ] = LoadCubeLut( path, bRaisesBlackLevelFloor );
+	cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
 	g_ColorMgmt.pending.externalDirtyCtr++;
 	return true;
 }
 
 bool set_color_look_g22(const char *path)
 {
-	LoadCubeLut( &g_ColorMgmtLooks[EOTF_Gamma22], path );
+	bool bRaisesBlackLevelFloor = false;
+	g_ColorMgmtLooks[EOTF_Gamma22] = LoadCubeLut( path, bRaisesBlackLevelFloor );
+	cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
 	g_ColorMgmt.pending.externalDirtyCtr++;
 	return true;
 }
@@ -1878,14 +1885,14 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 		return;
 	}
 
-	uint32_t sourceWidth = window->GetGeometry().nWidth;
-	uint32_t sourceHeight = window->GetGeometry().nHeight;
+	int32_t sourceWidth = window->GetGeometry().nWidth;
+	int32_t sourceHeight = window->GetGeometry().nHeight;
 
 	if ( fit )
 	{
 		// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
-		sourceWidth = std::max<uint32_t>( sourceWidth, clamp<int>( fit->GetGeometry().nX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
-		sourceHeight = std::max<uint32_t>( sourceHeight, clamp<int>( fit->GetGeometry().nY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+		sourceWidth = std::max<int32_t>( sourceWidth, clamp<int>( fit->GetGeometry().nX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
+		sourceHeight = std::max<int32_t>( sourceHeight, clamp<int>( fit->GetGeometry().nY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
 	}
 
 	float cursor_scale = 1.0f;
@@ -1943,6 +1950,8 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	layer->ctm = nullptr;
 	layer->hdr_metadata_blob = nullptr;
 	layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+
+	layer->eAlphaBlendingMode = cv_overlay_unmultiplied_alpha ? ALPHA_BLENDING_MODE_COVERAGE : ALPHA_BLENDING_MODE_PREMULTIPLIED;
 }
 
 void MouseCursor::updateCursorFeedback( bool bForce )
@@ -1971,6 +1980,7 @@ struct BaseLayerInfo_t
 	float offset[2];
 	float opacity;
 	GamescopeUpscaleFilter filter;
+	AlphaBlendingMode_t eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
 };
 
 std::array< BaseLayerInfo_t, HELD_COMMIT_COUNT > g_CachedPlanes = {};
@@ -2000,6 +2010,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	layer->tex = commit->vulkanTex;
 
 	layer->filter = base.filter;
+	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
 	layer->blackBorder = true;
 }
 
@@ -2011,6 +2022,7 @@ namespace PaintWindowFlag
 	static const uint32_t DrawBorders = 1u << 3;
 	static const uint32_t NoScale = 1u << 4;
 	static const uint32_t NoFilter = 1u << 5;
+	static const uint32_t CoverageMode = 1u << 6;
 }
 using PaintWindowFlags = uint32_t;
 
@@ -2032,10 +2044,13 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			  MouseCursor *cursor, PaintWindowFlags flags = 0, float flOpacityScale = 1.0f, steamcompmgr_win_t *fit = nullptr )
 
 {
-	uint32_t sourceWidth, sourceHeight;
+	int32_t sourceWidth, sourceHeight;
+	int32_t baseWidth, baseHeight;
 	int drawXOffset = 0, drawYOffset = 0;
 	float currentScaleRatio_x = 1.0;
 	float currentScaleRatio_y = 1.0;
+	float baseScaleRatio_x = 1.0;
+	float baseScaleRatio_y = 1.0;
 
 	// Exit out if we have no window or
 	// no commit.
@@ -2079,9 +2094,15 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 		if (w == scaleW) {
 			sourceWidth = layer->tex->width();
 			sourceHeight = layer->tex->height();
+
+			baseWidth = lastCommit->vulkanTex->width();
+			baseHeight = lastCommit->vulkanTex->height();
 		} else {
 			sourceWidth = scaleW->GetGeometry().nWidth;
 			sourceHeight = scaleW->GetGeometry().nHeight;
+
+			baseWidth = sourceWidth;
+			baseHeight = sourceHeight;
 		}
 
 		if ( fit )
@@ -2089,12 +2110,15 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
 			sourceWidth = std::max<uint32_t>( sourceWidth, clamp<int>( fit->GetGeometry().nX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
 			sourceHeight = std::max<uint32_t>( sourceHeight, clamp<int>( fit->GetGeometry().nY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+
+			baseWidth = std::max<uint32_t>( baseWidth, clamp<int>( fit->GetGeometry().nX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
+			baseHeight = std::max<uint32_t>( baseHeight, clamp<int>( fit->GetGeometry().nY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
 		}
 	}
 
 	bool offset = ( ( w->GetGeometry().nX || w->GetGeometry().nY ) && w != scaleW );
 
-	if (sourceWidth != currentOutputWidth || sourceHeight != currentOutputHeight || offset || globalScaleRatio != 1.0f)
+	if (sourceWidth != (int32_t)currentOutputWidth || sourceHeight != (int32_t)currentOutputHeight || offset || globalScaleRatio != 1.0f)
 	{
 		calc_scale_factor(currentScaleRatio_x, currentScaleRatio_y, sourceWidth, sourceHeight);
 
@@ -2107,10 +2131,11 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			drawYOffset += w->GetGeometry().nY * currentScaleRatio_y;
 		}
 
+		calc_scale_factor(baseScaleRatio_x, baseScaleRatio_y, baseWidth, baseHeight);
 		if ( zoomScaleRatio != 1.0 )
 		{
-			drawXOffset += (((int)sourceWidth / 2) - (cursor ? cursor->x() : 0)) * currentScaleRatio_x;
-			drawYOffset += (((int)sourceHeight / 2) - (cursor ? cursor->y() : 0)) * currentScaleRatio_y;
+			drawXOffset += (((int)baseWidth / 2) - (cursor ? cursor->x() : 0)) * baseScaleRatio_x;
+			drawYOffset += (((int)baseHeight / 2) - (cursor ? cursor->y() : 0)) * baseScaleRatio_y;
 		}
 	}
 
@@ -2165,6 +2190,8 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			layer->filter = GamescopeUpscaleFilter::NEAREST;
 	}
 
+	layer->eAlphaBlendingMode = ( flags & PaintWindowFlag::CoverageMode ) ? ALPHA_BLENDING_MODE_COVERAGE : ALPHA_BLENDING_MODE_PREMULTIPLIED;
+
 	return layer;
 }
 
@@ -2209,6 +2236,7 @@ paint_window(steamcompmgr_win_t *w, steamcompmgr_win_t *scaleW, struct FrameInfo
 		basePlane.offset[1] = layer->offset.y;
 		basePlane.opacity = layer->opacity;
 		basePlane.filter = layer->filter;
+		basePlane.eAlphaBlendingMode = layer->eAlphaBlendingMode;
 
 		g_CachedPlanes[ HELD_COMMIT_BASE ] = basePlane;
 		if ( !(flags & PaintWindowFlag::FadeTarget) )
@@ -2382,6 +2410,13 @@ bool ShouldDrawCursor()
 	return !pFocus->GetNestedHints();
 }
 
+gamescope::ConVar<bool> cv_paint_primary_plane{ "paint_primary_plane", true };
+gamescope::ConVar<bool> cv_paint_override_redirect_plane{ "paint_override_redirect_plane", true };
+gamescope::ConVar<bool> cv_paint_steam_overlay_plane{ "paint_steam_overlay_plane", true };
+gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay_plane", true };
+gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
+gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
+
 static void
 paint_all( global_focus_t *pFocus, bool async )
 {
@@ -2444,88 +2479,91 @@ paint_all( global_focus_t *pFocus, bool async )
 
 	// If the window we'd paint as the base layer is the streaming client,
 	// find the video underlay and put it up first in the scenegraph
-	if ( w )
+	if ( cv_paint_primary_plane )
 	{
-		if ( w->isSteamStreamingClient == true )
+		if ( w )
 		{
-			steamcompmgr_win_t *videow = NULL;
-			bool bHasVideoUnderlay = false;
-
-			gamescope_xwayland_server_t *server = NULL;
-			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			if ( w->isSteamStreamingClient == true )
 			{
-				for ( videow = server->ctx->list; videow; videow = videow->xwayland().next )
+				steamcompmgr_win_t *videow = NULL;
+				bool bHasVideoUnderlay = false;
+
+				gamescope_xwayland_server_t *server = NULL;
+				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 				{
-					if ( videow->isSteamStreamingClientVideo == true )
+					for ( videow = server->ctx->list; videow; videow = videow->xwayland().next )
 					{
-						// TODO: also check matching AppID so we can have several pairs
-						paint_window(videow, videow, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::DrawBorders);
-						bHasVideoUnderlay = true;
-						break;
+						if ( videow->isSteamStreamingClientVideo == true )
+						{
+							// TODO: also check matching AppID so we can have several pairs
+							paint_window(videow, videow, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::DrawBorders);
+							bHasVideoUnderlay = true;
+							break;
+						}
 					}
 				}
-			}
-			
-			int nOldLayerCount = frameInfo.layerCount;
+				
+				int nOldLayerCount = frameInfo.layerCount;
 
-			uint32_t flags = 0;
-			if ( !bHasVideoUnderlay )
-				flags |= PaintWindowFlag::BasePlane;
-			paint_window(w, w, &frameInfo, pFocus->cursor, flags);
-			if ( pFocus == GetCurrentFocus() )
-				update_touch_scaling( &frameInfo );
-			
-			// paint UI unless it's fully hidden, which it communicates to us through opacity=0
-			// we paint it to extract scaling coefficients above, then remove the layer if one was added
-			if ( w->opacity == TRANSLUCENT && bHasVideoUnderlay && nOldLayerCount < frameInfo.layerCount )
-				frameInfo.layerCount--;
-		}
-		else
-		{
-			if ( fadingOut )
-			{
-				float opacityScale = g_bPendingFade
-					? 0.0f
-					: ((currentTime - fadeOutStartTime) / (float)g_FadeOutDuration);
-		
-				paint_cached_base_layer(g_HeldCommits[HELD_COMMIT_FADE], g_CachedPlanes[HELD_COMMIT_FADE], &frameInfo, 1.0f - opacityScale, false);
-				paint_window(w, w, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::FadeTarget | PaintWindowFlag::DrawBorders, opacityScale, override);
+				uint32_t flags = 0;
+				if ( !bHasVideoUnderlay )
+					flags |= PaintWindowFlag::BasePlane;
+				paint_window(w, w, &frameInfo, pFocus->cursor, flags);
+				if ( pFocus == GetCurrentFocus() )
+					update_touch_scaling( &frameInfo );
+				
+				// paint UI unless it's fully hidden, which it communicates to us through opacity=0
+				// we paint it to extract scaling coefficients above, then remove the layer if one was added
+				if ( w->opacity == TRANSLUCENT && bHasVideoUnderlay && nOldLayerCount < frameInfo.layerCount )
+					frameInfo.layerCount--;
 			}
 			else
 			{
+				if ( fadingOut )
 				{
-					if ( g_HeldCommits[HELD_COMMIT_FADE] != nullptr )
-					{
-						g_HeldCommits[HELD_COMMIT_FADE] = nullptr;
-						g_bPendingFade = false;
-						fadeOutStartTime = 0;
-						pFocus->fadeWindow = None;
-					}
+					float opacityScale = g_bPendingFade
+						? 0.0f
+						: ((currentTime - fadeOutStartTime) / (float)g_FadeOutDuration);
+			
+					paint_cached_base_layer(g_HeldCommits[HELD_COMMIT_FADE], g_CachedPlanes[HELD_COMMIT_FADE], &frameInfo, 1.0f - opacityScale, false);
+					paint_window(w, w, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::FadeTarget | PaintWindowFlag::DrawBorders, opacityScale, override);
 				}
-				// Just draw focused window as normal, be it Steam or the game
-				paint_window(w, w, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::DrawBorders, 1.0f, override);
+				else
+				{
+					{
+						if ( g_HeldCommits[HELD_COMMIT_FADE] != nullptr )
+						{
+							g_HeldCommits[HELD_COMMIT_FADE] = nullptr;
+							g_bPendingFade = false;
+							fadeOutStartTime = 0;
+							pFocus->fadeWindow = None;
+						}
+					}
+					// Just draw focused window as normal, be it Steam or the game
+					paint_window(w, w, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::DrawBorders, 1.0f, override);
 
-				bool needsScaling = frameInfo.layers[0].scale.x < 0.999f && frameInfo.layers[0].scale.y < 0.999f;
-				frameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR && needsScaling;
-				frameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS && needsScaling;
+					bool needsScaling = frameInfo.layers[0].scale.x < 0.999f && frameInfo.layers[0].scale.y < 0.999f;
+					frameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR && needsScaling;
+					frameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS && needsScaling;
+				}
+				if ( pFocus == GetCurrentFocus() )
+					update_touch_scaling( &frameInfo );
 			}
-			if ( pFocus == GetCurrentFocus() )
-				update_touch_scaling( &frameInfo );
 		}
-	}
-	else
-	{
-		if ( g_HeldCommits[HELD_COMMIT_BASE] != nullptr )
+		else
 		{
-			float opacityScale = 1.0f;
-			if ( fadingOut )
+			if ( g_HeldCommits[HELD_COMMIT_BASE] != nullptr )
 			{
-				opacityScale = g_bPendingFade
-					? 0.0f
-					: ((currentTime - fadeOutStartTime) / (float)g_FadeOutDuration);
-			}
+				float opacityScale = 1.0f;
+				if ( fadingOut )
+				{
+					opacityScale = g_bPendingFade
+						? 0.0f
+						: ((currentTime - fadeOutStartTime) / (float)g_FadeOutDuration);
+				}
 
-			paint_cached_base_layer( g_HeldCommits[HELD_COMMIT_BASE], g_CachedPlanes[HELD_COMMIT_BASE], &frameInfo, opacityScale, true );
+				paint_cached_base_layer( g_HeldCommits[HELD_COMMIT_BASE], g_CachedPlanes[HELD_COMMIT_BASE], &frameInfo, opacityScale, true );
+			}
 		}
 	}
 
@@ -2533,7 +2571,7 @@ paint_all( global_focus_t *pFocus, bool async )
 	// with an offset.
 	// Josh: No override if we're streaming video
 	// as we will have too many layers. Better to be safe than sorry.
-	if ( override && w && !w->isSteamStreamingClient )
+	if ( override && w && !w->isSteamStreamingClient && cv_paint_override_redirect_plane )
 	{
 		paint_window(override, w, &frameInfo, pFocus->cursor, PaintWindowFlag::NoFilter, 1.0f, override);
 		// Don't update touch scaling for frameInfo. We don't ever make it our
@@ -2544,54 +2582,60 @@ paint_all( global_focus_t *pFocus, bool async )
 	// If we have any layers that aren't a cursor or overlay, then we have valid contents for presentation.
 	const bool bValidContents = frameInfo.layerCount > 0;
 
-  	if (externalOverlay)
+  	if (externalOverlay && cv_paint_external_overlay_plane )
 	{
 		if (externalOverlay->opacity)
 		{
-			paint_window(externalOverlay, externalOverlay, &frameInfo, pFocus->cursor, PaintWindowFlag::NoScale | PaintWindowFlag::NoFilter);
+			paint_window(externalOverlay, externalOverlay, &frameInfo, pFocus->cursor, PaintWindowFlag::NoScale | PaintWindowFlag::NoFilter |
+				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 ) );
 
 			if ( externalOverlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
 				update_touch_scaling( &frameInfo );
 		}
 	}
 
-	if (overlay && overlay->opacity)
+	if ( cv_paint_steam_overlay_plane )
 	{
-		paint_window(overlay, overlay, &frameInfo, pFocus->cursor, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter);
-
-		if ( overlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
-			update_touch_scaling( &frameInfo );
-	}
-	else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
-	{
-		auto tex = vulkan_get_hacky_blank_texture();
-		if ( tex != nullptr )
+		if (overlay && overlay->opacity )
 		{
-			// HACK! HACK HACK HACK
-			// To avoid stutter when toggling the overlay on 
-			int curLayer = frameInfo.layerCount++;
+			paint_window(overlay, overlay, &frameInfo, pFocus->cursor, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
+				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
 
-			FrameInfo_t::Layer_t *layer = &frameInfo.layers[ curLayer ];
+			if ( overlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
+				update_touch_scaling( &frameInfo );
+		}
+		else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
+		{
+			auto tex = vulkan_get_hacky_blank_texture();
+			if ( tex != nullptr )
+			{
+				// HACK! HACK HACK HACK
+				// To avoid stutter when toggling the overlay on 
+				int curLayer = frameInfo.layerCount++;
+
+				FrameInfo_t::Layer_t *layer = &frameInfo.layers[ curLayer ];
 
 
-			layer->scale.x = g_nOutputWidth == tex->width() ? 1.0f : tex->width() / (float)g_nOutputWidth;
-			layer->scale.y = g_nOutputHeight == tex->height() ? 1.0f : tex->height() / (float)g_nOutputHeight;
-			layer->offset.x = 0.0f;
-			layer->offset.y = 0.0f;
-			layer->opacity = 1.0f; // BLAH
-			layer->zpos = g_zposOverlay;
-			layer->applyColorMgmt = g_ColorMgmt.pending.enabled;
+				layer->scale.x = g_nOutputWidth == tex->width() ? 1.0f : tex->width() / (float)g_nOutputWidth;
+				layer->scale.y = g_nOutputHeight == tex->height() ? 1.0f : tex->height() / (float)g_nOutputHeight;
+				layer->offset.x = 0.0f;
+				layer->offset.y = 0.0f;
+				layer->opacity = 1.0f; // BLAH
+				layer->zpos = g_zposOverlay;
+				layer->applyColorMgmt = g_ColorMgmt.pending.enabled;
+				layer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_COVERAGE; // misyl: Always coverage and not premult in case of a Look applied.
 
-			layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
-			layer->hdr_metadata_blob = nullptr;
-			layer->ctm = nullptr;
-			layer->tex = tex;
+				layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+				layer->hdr_metadata_blob = nullptr;
+				layer->ctm = nullptr;
+				layer->tex = tex;
 
-			layer->filter = GamescopeUpscaleFilter::NEAREST;
-			layer->blackBorder = true;
+				layer->filter = GamescopeUpscaleFilter::NEAREST;
+				layer->blackBorder = true;
+			}
 		}
 	}
-
+	
 	if (notification)
 	{
 		if (notification->opacity)
@@ -2608,7 +2652,7 @@ paint_all( global_focus_t *pFocus, bool async )
 	}
 
 	// Draw cursor if we need to
-	if (input && ShouldDrawCursor()) {
+	if (input && ShouldDrawCursor() && cv_paint_cursor_plane) {
 		pFocus->cursor->paint(
 			input, w == input ? override : nullptr,
 			&frameInfo);
@@ -2680,7 +2724,7 @@ paint_all( global_focus_t *pFocus, bool async )
 		}
 	}
 
-	bool bDoMuraCompensation = is_mura_correction_enabled() && frameInfo.layerCount;
+	bool bDoMuraCompensation = is_mura_correction_enabled() && frameInfo.layerCount && cv_paint_mura_plane;
 	if ( bDoMuraCompensation )
 	{
 		auto& MuraCorrectionImage = s_MuraCorrectionImage[GetBackend()->GetScreenType()];
@@ -6804,9 +6848,18 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 				? EOTF_Gamma22
 				: EOTF_PQ;
 
+			float flOldGlobalScale = globalScaleRatio;
+			float flOldZoomScale = zoomScaleRatio;
+			float flOldOverscanScale = overscanScaleRatio;
+			overscanScaleRatio = 1.0f;
+			zoomScaleRatio = 1.0f;
+			globalScaleRatio = 1.0f;
 			paint_window_commit( newCommit, w, w, &upscaledFrameInfo, nullptr );
 			upscaledFrameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR;
 			upscaledFrameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS;
+			globalScaleRatio = flOldGlobalScale;
+			zoomScaleRatio = flOldZoomScale;
+			flOldOverscanScale = flOldOverscanScale;
 
 			TempUpscaleImage_t *pTempImage = GetTempUpscaleImage( g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat );
 			if ( pTempImage )

@@ -58,6 +58,7 @@
 #include "hdmi.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
+#include "color_helpers.h"
 #include "log.hpp"
 #include "ime.hpp"
 #include "xwayland_ctx.hpp"
@@ -110,7 +111,9 @@ static void wlserver_update_cursor_constraint();
 static void handle_pointer_constraint(struct wl_listener *listener, void *data);
 static void wlserver_constrain_cursor( struct wlr_pointer_constraint_v1 *pNewConstraint );
 struct wlr_surface *wlserver_surface_to_main_surface( struct wlr_surface *pSurface );
-void wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press );
+bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press );
+
+extern std::atomic<bool> hasRepaint;
 
 std::vector<ResListEntry_t>& gamescope_xwayland_server_t::retrieve_commits()
 {
@@ -331,10 +334,11 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 		}
 	}
 	
-	wlserver_process_hotkeys( keyboard, event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED );
-
-	wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard );
-	wlr_seat_keyboard_notify_key( wlserver.wlr.seat, event->time_msec, event->keycode, event->state );
+	if ( !wlserver_process_hotkeys( keyboard, event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED ) )
+	{
+		wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard );
+		wlr_seat_keyboard_notify_key( wlserver.wlr.seat, event->time_msec, event->keycode, event->state );
+	}
 
 	bump_input_counter();
 }
@@ -1056,6 +1060,112 @@ static void gamescope_control_display_sleep( struct wl_client *client, struct wl
 	}
 }
 
+extern gamescope::ConVar<bool> cv_overlay_unmultiplied_alpha;
+extern std::atomic<std::shared_ptr<lut3d_t>> g_ColorMgmtLooks[EOTF_Count];
+
+static gamescope::ConCommand cc_set_look("set_look", "Set a look for a specific EOTF. Eg. set_look mylook.cube (g22 only), set_look pq mylook.cube, set_look mylook_g22.cube mylook_pq.cube",
+[]( std::span<std::string_view> args )
+{
+	if ( args.size() == 2 )
+	{
+		std::string arg1 = std::string{ args[1] };
+		bool bRaisesBlackLevelFloor = false;
+		g_ColorMgmtLooks[ EOTF_Gamma22 ] = LoadCubeLut( arg1.c_str(), bRaisesBlackLevelFloor );
+		cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
+		g_ColorMgmt.pending.externalDirtyCtr++;
+		hasRepaint = true;
+	}
+	else if ( args.size() == 3 )
+	{
+		std::string arg2 = std::string{ args[2] };
+
+		bool bRaisesBlackLevelFloor = false;
+		if ( args[1] == "g22" || args[1] == "G22")
+		{
+			g_ColorMgmtLooks[ EOTF_Gamma22 ] = LoadCubeLut( arg2.c_str(), bRaisesBlackLevelFloor );
+		}
+		else if ( args[1] == "pq" || args[1] == "PQ" )
+		{
+			g_ColorMgmtLooks[ EOTF_PQ ] = LoadCubeLut( arg2.c_str(), bRaisesBlackLevelFloor );
+		}
+		else
+		{
+			std::string arg1 = std::string{ args[1] };
+
+			std::shared_ptr<lut3d_t> pG22LUT;
+			std::shared_ptr<lut3d_t> pPQLUT;
+
+			bool bDummy = false;
+			pG22LUT = LoadCubeLut( arg1.c_str(), bRaisesBlackLevelFloor );
+			pPQLUT = LoadCubeLut( arg2.c_str(), bDummy );
+
+			g_ColorMgmtLooks[ EOTF_Gamma22 ] = pG22LUT;
+			g_ColorMgmtLooks[ EOTF_PQ ] = pPQLUT;
+		}
+		cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
+		g_ColorMgmt.pending.externalDirtyCtr++;
+		hasRepaint = true;
+	}
+	else
+	{
+		cv_overlay_unmultiplied_alpha = false;
+		g_ColorMgmtLooks[ EOTF_Gamma22 ] = nullptr;
+		g_ColorMgmtLooks[ EOTF_PQ ] = nullptr;
+		g_ColorMgmt.pending.externalDirtyCtr++;
+		hasRepaint = true;
+	}
+});
+
+static void gamescope_control_set_look( struct wl_client *client, struct wl_resource *resource, int g22_fd, int pq_fd, uint32_t flags )
+{
+	std::shared_ptr<lut3d_t> pG22LUT;
+	std::shared_ptr<lut3d_t> pPQLUT;
+	bool bRaisesBlackLevelFloor = false;
+
+	if ( g22_fd >= 0 )
+	{
+		// takes ownership of FD.
+		FILE *pG22 = fdopen( g22_fd, "r" );
+		pG22LUT = LoadCubeLut( pG22, bRaisesBlackLevelFloor );
+		fclose( pG22 );
+		g22_fd = -1;
+	}
+
+	if ( pq_fd >= 0 )
+	{
+		// takes ownership of FD.
+		FILE *pPQ = fdopen( g22_fd, "r" );
+		bool bDummy = false;
+		pPQLUT = LoadCubeLut( pPQ, bDummy );
+		fclose( pPQ );
+		pq_fd = -1;
+	}
+
+	if ( !pG22LUT && !pPQLUT )
+	{
+		cv_overlay_unmultiplied_alpha = false;
+		g_ColorMgmtLooks[ EOTF_Gamma22 ] = nullptr;
+		g_ColorMgmtLooks[ EOTF_PQ ] = nullptr;
+		g_ColorMgmt.pending.externalDirtyCtr++;
+		hasRepaint = true;
+	}
+
+	cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
+	g_ColorMgmtLooks[ EOTF_Gamma22 ] = pG22LUT;
+	g_ColorMgmtLooks[ EOTF_PQ ] = pPQLUT;
+	g_ColorMgmt.pending.externalDirtyCtr++;
+	hasRepaint = true;
+}
+
+static void gamescope_control_unset_look( struct wl_client *client, struct wl_resource *resource )
+{
+	cv_overlay_unmultiplied_alpha = false;
+	g_ColorMgmtLooks[ EOTF_Gamma22 ] = nullptr;
+	g_ColorMgmtLooks[ EOTF_PQ ] = nullptr;
+	g_ColorMgmt.pending.externalDirtyCtr++;
+	hasRepaint = true;
+}
+
 static void gamescope_control_handle_destroy( struct wl_client *client, struct wl_resource *resource )
 {
 	wl_resource_destroy( resource );
@@ -1066,6 +1176,8 @@ static const struct gamescope_control_interface gamescope_control_impl = {
 	.set_app_target_refresh_cycle = gamescope_control_set_app_target_refresh_cycle,
 	.take_screenshot = gamescope_control_take_screenshot,
 	.display_sleep = gamescope_control_display_sleep,
+	.set_look = gamescope_control_set_look,
+	.unset_look = gamescope_control_unset_look,
 };
 
 static uint32_t get_conn_display_info_flags()
@@ -1130,6 +1242,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PIXEL_FILTER, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_REFRESH_CYCLE_ONLY_CHANGE_REFRESH_RATE, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_MURA_CORRECTION, 1, 0 );
+	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_LOOK, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DONE, 0, 0 );
 
 	wlserver_send_gamescope_control( resource );
@@ -1139,7 +1252,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 
 static void create_gamescope_control( void )
 {
-	uint32_t version = 4;
+	uint32_t version = 5;
 	wl_global_create( wlserver.display, &gamescope_control_interface, version, NULL, gamescope_control_bind );
 }
 
@@ -2074,20 +2187,12 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain )
 	}
 }
 
-void wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press )
+bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press )
 {
 	xkb_keycode_t keycode = key + 8;
 	xkb_keysym_t keysym = xkb_state_key_get_one_sym( keyboard->xkb_state, keycode );
 
-	// BUG: normalize to the same tab key.
-	// Sometimes when the keyboard comes online we'll receive key events as
-	// one of these two. We need to investigate why. For now lets just normalize
-	// to one of the two.
-	// TODO: A proper solution would probably be to have a set comparison that
-	// takes into account aliased characters, or uses a fully normalized set of
-	// chars.
-	if ( keysym == XKB_KEY_ISO_Left_Tab )
-		keysym = XKB_KEY_Tab;
+	keysym = NormalizeKeysymForHotkey( keysym );
 
 	static std::unordered_set<xkb_keysym_t> s_setPressedKeySyms;
 	if ( press )
@@ -2097,6 +2202,12 @@ void wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 	else
 	{
 		s_setPressedKeySyms.erase( keysym );
+	}
+
+	if ( log_binding.Enabled( LOG_DEBUG ) )
+	{
+		std::string sPressedKeySymsDebugName = ComputeDebugName( s_setPressedKeySyms );
+		log_binding.debugf( "Looking for: [%s].", sPressedKeySymsDebugName.c_str() );
 	}
 
 	{
@@ -2119,10 +2230,12 @@ void wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 					continue;
 
 				if ( pBinding->Execute() )
-					return;
+					return true;
 			}
 		}
 	}
+
+	return false;
 }
 
 void wlserver_key( uint32_t key, bool press, uint32_t time )
@@ -2131,16 +2244,15 @@ void wlserver_key( uint32_t key, bool press, uint32_t time )
 
 	wlr_keyboard *keyboard = wlserver.wlr.virtual_keyboard_device;
 
-	wlserver_process_hotkeys( keyboard, key, press );
-
-	assert( keyboard != nullptr );
-	wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard );
-	wlr_seat_keyboard_notify_key( wlserver.wlr.seat, time, key, press );
+	if ( !wlserver_process_hotkeys( keyboard, key, press ) )
+	{
+		assert( keyboard != nullptr );
+		wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard );
+		wlr_seat_keyboard_notify_key( wlserver.wlr.seat, time, key, press );
+	}
 
 	bump_input_counter();
 }
-
-extern std::atomic<bool> hasRepaint;
 
 struct wlr_surface *wlserver_surface_to_main_surface( struct wlr_surface *pSurface )
 {

@@ -1566,8 +1566,8 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
 {
 	PushData data(std::forward<Args>(args)...);
 
-	void *ptr = m_device->uploadBufferData(sizeof(data));
-	m_renderBufferOffset = m_device->m_uploadBufferOffset - sizeof(data);
+	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data));
+	m_renderBufferOffset = offset;
 	memcpy(ptr, &data, sizeof(data));
 }
 
@@ -3009,7 +3009,7 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
 	size_t lut3d_size = lut3d->width() * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
 
-	void* base_dst = g_device.uploadBufferData(lut1d_size + lut3d_size);
+	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size);
 
 	void* lut1d_dst = base_dst;
 	void *lut3d_dst = ((uint8_t*)base_dst) + lut1d_size;
@@ -3017,8 +3017,8 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	memcpy(lut3d_dst, lut3d_data, lut3d_size);
 
 	auto cmdBuffer = g_device.commandBuffer();
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), 0, 0, lut1d);
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), lut1d_size, 0, lut3d);
+	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
+	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
 	g_device.submit(std::move(cmdBuffer));
 	g_device.waitIdle(); // TODO: Sync this better
 }
@@ -3039,7 +3039,8 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width, 
 	bool bRes = texture->BInit( width, height, 1u, VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM ), flags );
 	assert( bRes );
 
-	uint8_t* dst = (uint8_t *)g_device.uploadBufferData( width * height * 4 );
+	auto [_dst, offset] = g_device.uploadBufferData( width * height * 4 );
+	uint8_t *dst = (uint8_t *)_dst;
 	for ( uint32_t i = 0; i < width * height * 4; i += 4 )
 	{
 		dst[i + 0] = b;
@@ -3049,7 +3050,7 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width, 
 	}
 
 	auto cmdBuffer = g_device.commandBuffer();
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), 0, 0, texture.get());
+	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), offset, 0, texture.get());
 	g_device.submit(std::move(cmdBuffer));
 	g_device.waitIdle();
 
@@ -3515,11 +3516,12 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t wi
 		return nullptr;
 
 	size_t size = width * height * DRMFormatGetBPP(drmFormat);
-	memcpy( g_device.uploadBufferData(size), bits, size );
+	auto [ dst, offset ] = g_device.uploadBufferData(size);
+	memcpy( dst, bits, size );
 
 	auto cmdBuffer = g_device.commandBuffer();
 
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), 0, 0, pTex.get());
+	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), offset, 0, pTex.get());
 	// TODO: Sync this copyBufferToImage.
 
 	g_device.submit(std::move(cmdBuffer));
@@ -3589,6 +3591,7 @@ struct BlitPushData_t
 	uint32_t blurRadius;
 
 	uint32_t u_shaderFilter;
+	uint32_t u_alphaMode;
 
     float u_linearToNits; // unset
     float u_nitsToLinear; // unset
@@ -3598,6 +3601,7 @@ struct BlitPushData_t
 	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo)
 	{
 		u_shaderFilter = 0;
+		u_alphaMode = 0;
 
 		for (int i = 0; i < frameInfo->layerCount; i++) {
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers[i];
@@ -3608,6 +3612,8 @@ struct BlitPushData_t
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
             else
                 u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+
+			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
 			if (layer->ctm)
 			{
@@ -3639,6 +3645,7 @@ struct BlitPushData_t
 		offset[0] = { 0.5f, 0.5f };
 		opacity[0] = 1.0f;
         u_shaderFilter = (uint32_t)GamescopeUpscaleFilter::LINEAR;
+		u_alphaMode = 0;
 		ctm[0] = glm::mat3x4
 		{
 			1, 0, 0, 0,
@@ -3718,6 +3725,7 @@ struct RcasPushData_t
 	uint32_t u_c1;
 
 	uint32_t u_shaderFilter;
+	uint32_t u_alphaMode;
 
     float u_linearToNits; // unset
     float u_nitsToLinear; // unset
@@ -3734,6 +3742,7 @@ struct RcasPushData_t
 		u_frameId = s_frameId++;
 		u_c1 = tmp.x;
 		u_shaderFilter = 0;
+		u_alphaMode = 0;
 
 		for (int i = 0; i < frameInfo->layerCount; i++)
 		{
@@ -3743,6 +3752,8 @@ struct RcasPushData_t
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
             else
                 u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+
+			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
 			if (layer->ctm)
 			{
