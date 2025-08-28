@@ -134,6 +134,7 @@ struct steamcompmgr_win_t {
 	bool outdatedInteractiveFocus = false;
 
 	uint64_t last_commit_first_latch_time = 0;
+	uint64_t last_commit_present_time = 0;
 
 	bool hasHwndStyle = false;
 	uint32_t hwndStyle = 0;
@@ -236,6 +237,8 @@ struct steamcompmgr_win_t {
 	}
 };
 
+extern std::atomic<bool> hasRepaint;
+
 namespace gamescope
 {
 	struct GamescopeScreenshotInfo
@@ -254,6 +257,7 @@ namespace gamescope
 		{
 			std::unique_lock lock{ m_ScreenshotInfoMutex };
 			m_ScreenshotInfo = std::move( info );
+			hasRepaint = true;
 		}
 
 		void TakeScreenshot( bool bAVIF )

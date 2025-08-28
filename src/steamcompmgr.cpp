@@ -6610,6 +6610,17 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
 	commit_t *lastCommit = get_window_last_done_commit_peek(w);
 	if (lastCommit)
 	{
+		// We might present the same commit multiple times. In these cases
+		// there will be no frametime delta as the last frame was just re-used.
+		uint64_t frametime_ns = lastCommit->present_time - w->last_commit_present_time;
+		if ( frametime_ns > 0 )
+		{
+			if ( w->appID > 0 )
+				wlserver_app_presented( w->appID, frametime_ns );
+
+			w->last_commit_present_time = lastCommit->present_time;
+		}
+
 		if (!lastCommit->presentation_feedbacks.empty() || lastCommit->present_id)
 		{
 			if (!lastCommit->presentation_feedbacks.empty())
@@ -8462,7 +8473,9 @@ steamcompmgr_main(int argc, char **argv)
 
 			// If we are running behind, allow tearing.
 
-			const bool bForceRepaint = g_bForceRepaint.exchange(false);
+			// A false vblank value means bShouldPaint will resolve to false below, effectively ignoring this flag and losing any request
+			// to force a repaint. Don't clear g_bForceRepaint unless vblank is true.
+			const bool bForceRepaint = vblank && g_bForceRepaint.exchange(false);
 			const bool bForceSyncFlip = bForceRepaint || is_fading_out();
 
 			// If we are compositing, always force sync flips because we currently wait
